@@ -6,9 +6,11 @@ import torchvision.transforms as T
 from PIL import Image
 import numpy as np
 import os
+import requests
+import io
 
 # --------- Config ----------
-MODEL_PATH = "best_model_for_streamlit.pth"  # your repo has best_model_for_streamlit.pth OR best_model_for_streamlit.pth
+MODEL_PATH = "best_model_for_streamlit.pth"  # file in repo root (or use MODEL_URL in secrets)
 IMG_SIZE = 224
 CLASS_NAMES = ["bird", "drone"]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,40 +62,85 @@ def build_simplecnn(num_classes=2):
             return x
     return SimpleCNN(num_classes=num_classes)
 
-# --------- Safe model loader (supports state_dict or {"model_state":...}) ----------
-def load_saved_model(path, device=DEVICE):
-    ck = torch.load(path, map_location=device)
-    # determine state dict and model name hint
-    model_state = None
-    model_name_hint = None
+# --------- Robust torch.load utilities ----------
+def safe_torch_load(path_or_bytes, map_location="cpu"):
+    """
+    Try multiple safe ways to load a checkpoint:
+      - path_or_bytes: either a filesystem path or raw bytes (downloaded)
+    Returns the loaded object or raises RuntimeError.
+    """
+    import torch as _torch
+    import numpy as _np
+    last_err = None
+
+    def try_load(obj):
+        try:
+            return _torch.load(obj, map_location=map_location)
+        except Exception as e:
+            raise e
+
+    # If path_or_bytes is bytes-like, convert to BytesIO for torch.load
+    obj = path_or_bytes
+    is_bytes = isinstance(path_or_bytes, (bytes, bytearray, io.BytesIO))
+    if is_bytes:
+        obj = io.BytesIO(path_or_bytes)
+
+    # 1) Try plain load
+    try:
+        return try_load(obj)
+    except Exception as e1:
+        last_err = e1
+
+    # 2) Try weights_only=False (PyTorch >=2.6)
+    try:
+        try:
+            return _torch.load(obj, map_location=map_location, weights_only=False)
+        except TypeError:
+            # this torch version doesn't accept weights_only
+            raise
+    except Exception as e2:
+        last_err = e2
+
+    # 3) Try to allowlist numpy scalar global then load again
+    try:
+        # add safe globals for numpy scalar if the API exists
+        if hasattr(_torch.serialization, "add_safe_globals"):
+            try:
+                _torch.serialization.add_safe_globals([_np._core.multiarray.scalar])
+            except Exception:
+                pass
+        elif hasattr(_torch.serialization, "safe_globals"):
+            try:
+                _torch.serialization.safe_globals([_np._core.multiarray.scalar])
+            except Exception:
+                pass
+
+        # Try loading again; attempt weights_only=False first
+        try:
+            return _torch.load(obj, map_location=map_location, weights_only=False)
+        except TypeError:
+            return _torch.load(obj, map_location=map_location)
+    except Exception as e3:
+        last_err = e3
+
+    raise RuntimeError(f"Failed to load checkpoint. Last error: {last_err}")
+
+def extract_state_dict(ck):
+    """
+    Given a loaded checkpoint object, return a plain state_dict mapping.
+    Handles common formats: {'model_state': ...}, {'state_dict': ...}, direct state_dict.
+    """
+    import torch as _torch
     if isinstance(ck, dict):
         if "model_state" in ck:
-            model_state = ck["model_state"]
-        elif "state_dict" in ck:
-            model_state = ck["state_dict"]
-        else:
-            # heuristic: if many tensor values -> treat ck as state_dict
-            vals = list(ck.values())
-            if len(vals) and all(isinstance(v, torch.Tensor) for v in vals[:min(10,len(vals))]):
-                model_state = ck
-    else:
-        # fallback: assume ck is state_dict
-        model_state = ck
-
-    # if we have a state, try to load into efficientnet first, otherwise simplecnn
-    if model_state is None:
-        raise RuntimeError("Could not find a state_dict in checkpoint.")
-
-    # try EfficientNet architecture
-    try:
-        model = build_efficientnet(num_classes=2)
-        model.load_state_dict(model_state)
-        return model.to(device), "efficientnet_b0"
-    except Exception:
-        # try SimpleCNN
-        model = build_simplecnn(num_classes=2)
-        model.load_state_dict(model_state)
-        return model.to(device), "SimpleCNN"
+            return ck["model_state"]
+        if "state_dict" in ck:
+            return ck["state_dict"]
+        # heuristic: if values are tensors -> treat as state_dict
+        vals = list(ck.values())
+        if len(vals) and all(isinstance(v, _torch.Tensor) for v in vals[:min(10, len(vals))]):
+            return ck
+    raise ValueError("Could not extract state_dict from checkpoint. Keys: " + (str(list(ck.keys())) if isinstance(ck, dict) else str(type(ck))))
 
 # --------- Transforms ----------
 transform = T.Compose([
@@ -102,19 +149,71 @@ transform = T.Compose([
     T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
 ])
 
-# --------- Load model once ----------
+# --------- Load model once (supports MODEL_URL secret) ----------
 @st.cache_resource
 def get_model():
-    if not os.path.exists(MODEL_PATH):
-        st.error(f"Model file not found at {MODEL_PATH}. Upload it to the repo root or set MODEL_URL in secrets.")
-        return None, None
+    # Determine path or download from MODEL_URL if provided in secrets
+    path = None
+    model_bytes = None
+    # If user set MODEL_URL in Streamlit secrets, download model at runtime
+    secret_url = None
     try:
-        model, model_name = load_saved_model(MODEL_PATH)
-        model.eval()
-        return model, model_name
+        secret_url = st.secrets["MODEL_URL"]
+    except Exception:
+        secret_url = None
+
+    if secret_url:
+        try:
+            resp = requests.get(secret_url, timeout=60)
+            resp.raise_for_status()
+            model_bytes = resp.content
+        except Exception as e:
+            st.error(f"Failed to download model from MODEL_URL: {e}")
+            return None, None
+    else:
+        # use local model path in repo
+        if not os.path.exists(MODEL_PATH):
+            st.error(f"Model file not found at {MODEL_PATH}. Upload it to the repo root or set MODEL_URL in secrets.")
+            return None, None
+        path = MODEL_PATH
+
+    # Load checkpoint safely
+    try:
+        ck = None
+        if model_bytes is not None:
+            ck = safe_torch_load(model_bytes, map_location=DEVICE)
+        else:
+            ck = safe_torch_load(path, map_location=DEVICE)
     except Exception as e:
-        st.error(f"Failed to load model: {e}")
+        st.error(f"Failed to load checkpoint safely: {e}")
         return None, None
+
+    # Extract state_dict
+    try:
+        state = extract_state_dict(ck)
+    except Exception as e:
+        # Try common fallback keys
+        if isinstance(ck, dict) and "model_state" in ck:
+            state = ck["model_state"]
+        else:
+            st.error(f"Failed to extract state_dict from checkpoint: {e}")
+            return None, None
+
+    # Try EfficientNet then SimpleCNN
+    try:
+        model = build_efficientnet(num_classes=2)
+        model.load_state_dict(state)
+        model.to(DEVICE)
+        return model.eval(), "efficientnet_b0"
+    except Exception:
+        try:
+            model = build_simplecnn(num_classes=2)
+            model.load_state_dict(state)
+            model.to(DEVICE)
+            return model.eval(), "SimpleCNN"
+        except Exception as e:
+            st.error(f"Failed to load model into known architectures: {e}")
+            return None, None
 
 model, model_name = get_model()
 if model is None:
@@ -156,7 +255,8 @@ if uploaded is not None:
                 target_layer = module
                 break
         if target_layer is not None:
-            cam = GradCAM(model=model, target_layers=[target_layer], use_cuda=False)
+            # grad-cam expects CPU/cuda depending on use, use CPU to be safe here
+            cam = GradCAM(model=model, target_layers=[target_layer], use_cuda=torch.cuda.is_available())
             grayscale_cam = cam(input_tensor=x.cpu(), targets=[ClassifierOutputTarget(pred_idx)])[0]
             rgb_img = np.array(img.resize((IMG_SIZE,IMG_SIZE))).astype(np.float32) / 255.0
             cam_image = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
@@ -164,6 +264,7 @@ if uploaded is not None:
         else:
             st.info("Grad-CAM not available for this model.")
     except Exception as e:
+        # do not fail the app if grad-cam not installed or errors out
         st.info("Grad-CAM unavailable: " + str(e))
 
 st.write("---")
