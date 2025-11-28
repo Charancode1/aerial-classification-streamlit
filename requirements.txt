@@ -6,4 +6,4 @@ numpy
 matplotlib
 opencv-python-headless
 scikit-learn
-grad-cam==1.3.12
+grad-cam==1.5.5
