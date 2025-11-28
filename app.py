@@ -10,7 +10,7 @@ import requests
 import io
 
 # --------- Config ----------
-MODEL_PATH = "best_model_for_streamlit.pth"  # file in repo root (or use MODEL_URL in secrets)
+MODEL_PATH = "best_model_for_streamlit.pth"  # fallback local path (not used if MODEL_URL set)
 IMG_SIZE = 224
 CLASS_NAMES = ["bird", "drone"]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,45 +65,40 @@ def build_simplecnn(num_classes=2):
 # --------- Robust torch.load utilities ----------
 def safe_torch_load(path_or_bytes, map_location="cpu"):
     """
-    Try multiple safe ways to load a checkpoint:
-      - path_or_bytes: either a filesystem path or raw bytes (downloaded)
-    Returns the loaded object or raises RuntimeError.
+    Try multiple ways to load a checkpoint safely.
+    - If path_or_bytes is bytes, pass BytesIO to torch.load.
+    - Always load into CPU (map_location='cpu') to avoid CUDA issues; move model to DEVICE afterward.
     """
     import torch as _torch
     import numpy as _np
     last_err = None
 
-    def try_load(obj):
-        try:
-            return _torch.load(obj, map_location=map_location)
-        except Exception as e:
-            raise e
+    def do_load(obj):
+        return _torch.load(obj, map_location='cpu')  # always load to cpu
 
-    # If path_or_bytes is bytes-like, convert to BytesIO for torch.load
+    # prepare object
     obj = path_or_bytes
-    is_bytes = isinstance(path_or_bytes, (bytes, bytearray, io.BytesIO))
-    if is_bytes:
+    if isinstance(path_or_bytes, (bytes, bytearray)):
         obj = io.BytesIO(path_or_bytes)
 
-    # 1) Try plain load
+    # 1) Try plain load (to cpu)
     try:
-        return try_load(obj)
+        return do_load(obj)
     except Exception as e1:
         last_err = e1
 
     # 2) Try weights_only=False (PyTorch >=2.6)
     try:
         try:
-            return _torch.load(obj, map_location=map_location, weights_only=False)
+            return _torch.load(obj, map_location='cpu', weights_only=False)
         except TypeError:
-            # this torch version doesn't accept weights_only
+            # old torch does not support weights_only arg
             raise
     except Exception as e2:
         last_err = e2
 
-    # 3) Try to allowlist numpy scalar global then load again
+    # 3) Try allowlisting numpy scalar then reload
     try:
-        # add safe globals for numpy scalar if the API exists
         if hasattr(_torch.serialization, "add_safe_globals"):
             try:
                 _torch.serialization.add_safe_globals([_np._core.multiarray.scalar])
@@ -114,12 +109,11 @@ def safe_torch_load(path_or_bytes, map_location="cpu"):
                 _torch.serialization.safe_globals([_np._core.multiarray.scalar])
             except Exception:
                 pass
-
-        # Try loading again; attempt weights_only=False first
+        # try again
         try:
-            return _torch.load(obj, map_location=map_location, weights_only=False)
+            return _torch.load(obj, map_location='cpu', weights_only=False)
         except TypeError:
-            return _torch.load(obj, map_location=map_location)
+            return _torch.load(obj, map_location='cpu')
     except Exception as e3:
         last_err = e3
 
@@ -127,8 +121,7 @@ def safe_torch_load(path_or_bytes, map_location="cpu"):
 
 def extract_state_dict(ck):
     """
-    Given a loaded checkpoint object, return a plain state_dict mapping.
-    Handles common formats: {'model_state': ...}, {'state_dict': ...}, direct state_dict.
+    Return a plain state_dict from common checkpoint formats.
     """
     import torch as _torch
     if isinstance(ck, dict):
@@ -136,9 +129,8 @@ def extract_state_dict(ck):
             return ck["model_state"]
         if "state_dict" in ck:
             return ck["state_dict"]
-        # heuristic: if values are tensors -> treat as state_dict
         vals = list(ck.values())
-        if len(vals) and all(isinstance(v, _torch.Tensor) for v in vals[:min(10, len(vals))]):
+        if len(vals) and all(isinstance(v, _torch.Tensor) for v in vals[:min(10,len(vals))]):
             return ck
     raise ValueError("Could not extract state_dict from checkpoint. Keys: " + (str(list(ck.keys())) if isinstance(ck, dict) else str(type(ck))))
 
@@ -149,57 +141,59 @@ transform = T.Compose([
     T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
 ])
 
+# helper: stream-download to bytes
+def download_url_to_bytes(url, timeout=120):
+    try:
+        with requests.get(url, stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            content_type = r.headers.get("content-type","")
+            # guard: ensure not HTML (common when Drive shows an HTML page)
+            if "text/html" in content_type:
+                raise RuntimeError(f"Download returned HTML content (content-type={content_type}). Check the URL or sharing settings.")
+            # read full content
+            data = r.content
+            return data
+    except Exception as e:
+        raise RuntimeError(f"Failed to download model from URL: {e}")
+
 # --------- Load model once (supports MODEL_URL secret) ----------
 @st.cache_resource
 def get_model():
-    # Determine path or download from MODEL_URL if provided in secrets
-    path = None
+    # If MODEL_URL secret set, download from it; otherwise try local MODEL_PATH
+    secret_url = st.secrets.get("MODEL_URL") if hasattr(st, "secrets") else None
     model_bytes = None
-    # If user set MODEL_URL in Streamlit secrets, download model at runtime
-    secret_url = None
-    try:
-        secret_url = st.secrets["MODEL_URL"]
-    except Exception:
-        secret_url = None
-
     if secret_url:
         try:
-            resp = requests.get(secret_url, timeout=60)
-            resp.raise_for_status()
-            model_bytes = resp.content
+            model_bytes = download_url_to_bytes(secret_url)
         except Exception as e:
-            st.error(f"Failed to download model from MODEL_URL: {e}")
+            st.error(str(e))
             return None, None
     else:
-        # use local model path in repo
         if not os.path.exists(MODEL_PATH):
-            st.error(f"Model file not found at {MODEL_PATH}. Upload it to the repo root or set MODEL_URL in secrets.")
+            st.error(f"Model file not found at {MODEL_PATH}. Upload it or set MODEL_URL in secrets.")
             return None, None
-        path = MODEL_PATH
 
-    # Load checkpoint safely
+    # load checkpoint safely (load into CPU)
     try:
-        ck = None
         if model_bytes is not None:
-            ck = safe_torch_load(model_bytes, map_location=DEVICE)
+            ck = safe_torch_load(model_bytes, map_location='cpu')
         else:
-            ck = safe_torch_load(path, map_location=DEVICE)
+            ck = safe_torch_load(MODEL_PATH, map_location='cpu')
     except Exception as e:
         st.error(f"Failed to load checkpoint safely: {e}")
         return None, None
 
-    # Extract state_dict
+    # extract state_dict
     try:
         state = extract_state_dict(ck)
     except Exception as e:
-        # Try common fallback keys
         if isinstance(ck, dict) and "model_state" in ck:
             state = ck["model_state"]
         else:
-            st.error(f"Failed to extract state_dict from checkpoint: {e}")
+            st.error(f"Failed to extract state_dict: {e}")
             return None, None
 
-    # Try EfficientNet then SimpleCNN
+    # try architectures
     try:
         model = build_efficientnet(num_classes=2)
         model.load_state_dict(state)
@@ -212,7 +206,7 @@ def get_model():
             model.to(DEVICE)
             return model.eval(), "SimpleCNN"
         except Exception as e:
-            st.error(f"Failed to load model into known architectures: {e}")
+            st.error(f"Failed to load state into known architectures: {e}")
             return None, None
 
 model, model_name = get_model()
@@ -248,14 +242,12 @@ if uploaded is not None:
         from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
         from pytorch_grad_cam.utils.image import show_cam_on_image
 
-        # pick last conv layer heuristically
         target_layer = None
         for name, module in reversed(list(model.named_modules())):
             if isinstance(module, nn.Conv2d):
                 target_layer = module
                 break
         if target_layer is not None:
-            # grad-cam expects CPU/cuda depending on use, use CPU to be safe here
             cam = GradCAM(model=model, target_layers=[target_layer], use_cuda=torch.cuda.is_available())
             grayscale_cam = cam(input_tensor=x.cpu(), targets=[ClassifierOutputTarget(pred_idx)])[0]
             rgb_img = np.array(img.resize((IMG_SIZE,IMG_SIZE))).astype(np.float32) / 255.0
@@ -264,7 +256,6 @@ if uploaded is not None:
         else:
             st.info("Grad-CAM not available for this model.")
     except Exception as e:
-        # do not fail the app if grad-cam not installed or errors out
         st.info("Grad-CAM unavailable: " + str(e))
 
 st.write("---")
